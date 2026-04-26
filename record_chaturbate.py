@@ -8,7 +8,7 @@ import urllib.parse
 
 # Configuration
 ROOM_SLUG = "seltin_sweety"
-AUTO_REFRESH = False
+AUTO_REFRESH = True
 AUTO_REFRESH_INTERVAL = 300  # seconds
 API_URL = "https://chaturbate.com/get_edge_hls_url_ajax/"
 
