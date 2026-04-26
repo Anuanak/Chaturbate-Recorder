@@ -69,6 +69,9 @@ try:
         date_str = now.strftime("%m.%d.%Y")
         hash_str = hashlib.md5(ROOM_SLUG.encode()).hexdigest()[:8]
         filename = f"{date_str}_{hash_str}_{ROOM_SLUG}_recording.mp4"
+    elif data.get("room_status") == "ticket":
+        print("Room is in ticket mode. Cannot record without payment.")
+        sys.exit(1)
     else:
         print(f"Error: Room status is '{data.get('room_status')}'. Cannot record.")
         sys.exit(1)
@@ -87,6 +90,7 @@ except (subprocess.CalledProcessError, FileNotFoundError):
 
 ffmpeg_cmd = [
     "ffmpeg",
+    "-f", "hls",
     "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "-headers", "Referer: https://chaturbate.com/\r\n",
     "-i", stream_url,
@@ -136,8 +140,13 @@ if AUTO_REFRESH:
                     ffmpeg_process.terminate()
                     ffmpeg_process.wait()
                     stream_url = new_stream_url
-                    ffmpeg_cmd[5] = stream_url  # update the input URL
+                    ffmpeg_cmd[8] = stream_url  # update the input URL
                     ffmpeg_process = subprocess.Popen(ffmpeg_cmd)
+            elif data.get("room_status") == "ticket":
+                print("Room switched to ticket mode. Stopping recording.")
+                ffmpeg_process.terminate()
+                ffmpeg_process.wait()
+                break
             else:
                 print("Room not public anymore, stopping recording.")
                 ffmpeg_process.terminate()
