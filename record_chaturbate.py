@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Chaturbate Recorder Void — автономный регистратор с разделением по папкам.
+Chaturbate Recorder Void — непрерывная запись с мгновенным восстановлением.
 Запуск: python recorder_void.py <room_slug> [--auto-refresh]
 """
 
@@ -17,8 +17,8 @@ import signal
 
 # ----------------------------- НАСТРОЙКИ -----------------------------
 ROOM_SLUG = "seltin_sweety"              # комната по умолчанию
-AUTO_REFRESH = True                      # включить периодическую проверку смены URL
-AUTO_REFRESH_INTERVAL = 300              # интервал проверки (сек)
+AUTO_REFRESH = False                     # если True — раз в N секунд проверяет смену URL (редко нужно)
+AUTO_REFRESH_INTERVAL = 300              # интервал проверки (только если AUTO_REFRESH = True)
 URL_FETCH_RETRIES = 3                    # число попыток получить ссылку при сбое
 FFMPEG_RESTART_DELAY = 5                 # пауза перед перезапуском ffmpeg
 OUTPUT_BASE_DIR = "recordings"           # корневая папка для всех записей
@@ -107,17 +107,14 @@ def build_ffmpeg_cmd(stream_url, filename):
         "-headers", "Referer: https://chaturbate.com/\r\n",
         "-i", stream_url,
         "-c", "copy",
-        "-bsf:v", "h264_mp4toannexb",   # обязательно для совместимости с TS
+        "-bsf:v", "h264_mp4toannexb",
         "-f", "mpegts",
-        "-y",                            # перезаписывать старый файл (мы даём уникальное имя)
+        "-y",
         filename
     ]
 
 def graceful_stop(process, timeout=10):
-    """
-    Мягко останавливает ffmpeg: сначала SIGINT/Ctrl+Break,
-    затем жёсткий terminate при зависании.
-    """
+    """Мягко завершить ffmpeg, давая время на запись последних пакетов."""
     if process.poll() is not None:
         return
     try:
@@ -158,7 +155,6 @@ else:
 
 if room_status != "public" or not stream_url:
     print(f"Room status is '{room_status}'. Waiting for public stream...")
-    # Будем ждать, пока комната не станет публичной
     while True:
         time.sleep(30)
         try:
@@ -177,10 +173,6 @@ hash_str = hashlib.md5(ROOM_SLUG.encode()).hexdigest()[:8]
 base_filename = os.path.join(room_dir, f"{date_str}_{hash_str}_{ROOM_SLUG}_recording")
 
 def find_free_filename():
-    """
-    Находит первое незанятое имя: base.ts, base_part2.ts, base_part3.ts ...
-    Возвращает (filename, next_part_number).
-    """
     if not os.path.exists(f"{base_filename}.ts"):
         return f"{base_filename}.ts", 1
     part = 2
@@ -198,9 +190,6 @@ print(f"Starting recording to {filename}...")
 ffmpeg_process = subprocess.Popen(ffmpeg_cmd)
 
 def get_next_filename():
-    """
-    Увеличивает счётчик и возвращает имя для следующей части.
-    """
     global restart_counter, base_filename
     restart_counter += 1
     candidate = f"{base_filename}_part{restart_counter}.ts"
@@ -209,15 +198,15 @@ def get_next_filename():
         candidate = f"{base_filename}_part{restart_counter}.ts"
     return candidate
 
-# ------------------- ГЛАВНЫЙ ЦИКЛ МОНИТОРИНГА -----------------------
+# ------------------- ГЛАВНЫЙ ЦИКЛ (МГНОВЕННОЕ ВОССТАНОВЛЕНИЕ) -------
 last_url_check = time.time()
 
 try:
     while True:
         poll = ffmpeg_process.poll()
         if poll is not None:
-            print(f"FFmpeg exited with code {poll}. Trying to resume...")
-            # Бесконечно пытаемся восстановиться, пока комната не станет публичной
+            # FFmpeg упал — сразу пытаемся перезапуститься
+            print(f"FFmpeg exited with code {poll}. Attempting immediate recovery...")
             while True:
                 for attempt in range(URL_FETCH_RETRIES):
                     try:
@@ -226,8 +215,8 @@ try:
                             stream_url = new_url
                             break
                         else:
-                            print(f"Room status is '{new_status}'. Waiting 30s...")
-                            time.sleep(30)
+                            print(f"Room status is '{new_status}'. Waiting 10s...")
+                            time.sleep(10)
                     except Exception as e:
                         print(f"Refresh attempt {attempt+1} failed: {e}")
                         time.sleep(2)
@@ -237,42 +226,25 @@ try:
 
             new_filename = get_next_filename()
             ffmpeg_cmd = build_ffmpeg_cmd(stream_url, new_filename)
-            print(f"Restarting FFmpeg to {new_filename}")
+            print(f"Restarting FFmpeg → {new_filename}")
             ffmpeg_process = subprocess.Popen(ffmpeg_cmd)
             last_url_check = time.time()
-        else:
-            # Плановая проверка смены URL
-            if AUTO_REFRESH and (time.time() - last_url_check > AUTO_REFRESH_INTERVAL):
-                last_url_check = time.time()
-                try:
-                    new_url, new_status = fetch_stream_url()
-                    if new_status != "public":
-                        print("Room is not public anymore. Pausing recording...")
-                        graceful_stop(ffmpeg_process)
-                        # Ждём возвращения публичного статуса
-                        while True:
-                            time.sleep(30)
-                            try:
-                                new_url, new_status = fetch_stream_url()
-                                if new_status == "public" and new_url:
-                                    stream_url = new_url
-                                    break
-                                else:
-                                    print(f"Room status is '{new_status}'. Waiting...")
-                            except Exception as e:
-                                print(f"Status check failed: {e}")
-                        new_filename = get_next_filename()
-                        ffmpeg_cmd = build_ffmpeg_cmd(stream_url, new_filename)
-                        ffmpeg_process = subprocess.Popen(ffmpeg_cmd)
-                    elif new_url and new_url != stream_url:
-                        print("Stream URL changed, restarting recording...")
-                        graceful_stop(ffmpeg_process)
-                        stream_url = new_url
-                        new_filename = get_next_filename()
-                        ffmpeg_cmd = build_ffmpeg_cmd(stream_url, new_filename)
-                        ffmpeg_process = subprocess.Popen(ffmpeg_cmd)
-                except Exception as e:
-                    print(f"Periodic URL check failed: {e}")
+
+        # Опциональная плановая проверка (только если включена)
+        if AUTO_REFRESH and (time.time() - last_url_check > AUTO_REFRESH_INTERVAL):
+            last_url_check = time.time()
+            try:
+                check_url, check_status = fetch_stream_url()
+                if check_status == "public" and check_url and check_url != stream_url:
+                    print("Stream URL changed (periodic check). Restarting...")
+                    graceful_stop(ffmpeg_process)
+                    stream_url = check_url
+                    new_filename = get_next_filename()
+                    ffmpeg_cmd = build_ffmpeg_cmd(stream_url, new_filename)
+                    ffmpeg_process = subprocess.Popen(ffmpeg_cmd)
+            except Exception as e:
+                print(f"Periodic URL check failed: {e}")
+
         time.sleep(1)
 
 except KeyboardInterrupt:
