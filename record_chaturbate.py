@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+"""
+Chaturbate Recorder Void
+Запись публичных трансляций через внутренний API.
+Запуск: python recorder_void.py <room_slug> [--auto-refresh]
+"""
+
 import requests
 import subprocess
 import sys
@@ -6,39 +13,48 @@ import hashlib
 import time
 import urllib.parse
 import re
+import os
+import signal
 
-# ---------- настройки ----------
-ROOM_SLUG = "seltin_sweety"
-AUTO_REFRESH = True
-AUTO_REFRESH_INTERVAL = 300   # интервал плановой проверки статуса комнаты (сек)
-URL_FETCH_RETRIES = 3         # попыток получить ссылку при ошибке
-FFMPEG_RESTART_DELAY = 5      # пауза перед перезапуском ffmpeg (сек)
+# ----------------------------- НАСТРОЙКИ -----------------------------
+ROOM_SLUG = "seltin_sweety"              # комната по умолчанию
+AUTO_REFRESH = True                      # включить периодическую проверку смены URL
+AUTO_REFRESH_INTERVAL = 300              # интервал проверки (сек)
+URL_FETCH_RETRIES = 3                    # число попыток получить ссылку при сбое
+FFMPEG_RESTART_DELAY = 5                 # пауза перед перезапуском ffmpeg
 HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
 }
 API_URL = "https://chaturbate.com/get_edge_hls_url_ajax/"
 
-# ---------- аргументы командной строки ----------
+# ------------------------- АРГУМЕНТЫ КОМАНДНОЙ СТРОКИ ----------------
 args = sys.argv[1:]
 for arg in args[:]:
     if arg in ("--auto-refresh", "-u"):
         AUTO_REFRESH = True
         args.remove(arg)
     elif arg in ("--help", "-h"):
-        print("Usage: python record_chaturbate.py <room_slug> [--auto-refresh]")
+        print("Usage: python recorder_void.py <room_slug> [--auto-refresh]")
         sys.exit(0)
 
 if args:
     ROOM_SLUG = args[0]
 
-# ---------- вспомогательные функции ----------
+# --------------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ------------------
 def fetch_stream_url():
-    """Получить URL лучшего качества для комнаты. Возвращает (url, room_status)."""
+    """
+    Получает URL потока максимального качества через API.
+    Возвращает (stream_url, room_status) или (None, status) при неудаче.
+    """
     payload = {"room_slug": ROOM_SLUG}
-    resp = requests.post(API_URL, headers=HEADERS, data=payload)
-    resp.raise_for_status()
-    data = resp.json()
+    try:
+        resp = requests.post(API_URL, headers=HEADERS, data=payload, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        raise Exception(f"API request failed: {e}")
+
     if not data.get("success"):
         raise Exception(f"API returned success=false: {data}")
     room_status = data.get("room_status")
@@ -49,19 +65,26 @@ def fetch_stream_url():
     if not master_url:
         raise Exception("No stream URL in API response")
 
-    # Получаем мастер-плейлист и выбираем максимальный битрейт
-    master_resp = requests.get(master_url, headers={"User-Agent": HEADERS["User-Agent"]})
-    master_resp.raise_for_status()
-    lines = master_resp.text.splitlines()
+    # Загружаем мастер-плейлист и выбираем вариант с макс. битрейтом
+    try:
+        master_resp = requests.get(master_url, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=15)
+        master_resp.raise_for_status()
+        lines = master_resp.text.splitlines()
+    except Exception as e:
+        raise Exception(f"Failed to fetch master playlist: {e}")
+
     max_bw = 0
     best_variant = None
     for i, line in enumerate(lines):
         if line.startswith("#EXT-X-STREAM-INF") and "BANDWIDTH=" in line:
-            bw = int(re.search(r'BANDWIDTH=(\d+)', line).group(1))
-            if bw > max_bw:
-                max_bw = bw
-                if i + 1 < len(lines):
-                    best_variant = lines[i + 1].strip()
+            match = re.search(r'BANDWIDTH=(\d+)', line)
+            if match:
+                bw = int(match.group(1))
+                if bw > max_bw:
+                    max_bw = bw
+                    if i + 1 < len(lines):
+                        best_variant = lines[i + 1].strip()
+
     if best_variant:
         stream_url = urllib.parse.urljoin(master_url, best_variant)
     else:
@@ -69,7 +92,10 @@ def fetch_stream_url():
     return stream_url, room_status
 
 def build_ffmpeg_cmd(stream_url, filename):
-    """Создать команду ffmpeg с правильными заголовками."""
+    """
+    Собирает команду ffmpeg для записи в MPEG-TS с корректным
+    преобразованием H.264 из avcC в Annex B.
+    """
     return [
         "ffmpeg",
         "-f", "hls",
@@ -77,17 +103,41 @@ def build_ffmpeg_cmd(stream_url, filename):
         "-headers", "Referer: https://chaturbate.com/\r\n",
         "-i", stream_url,
         "-c", "copy",
+        "-bsf:v", "h264_mp4toannexb",   # обязательно для совместимости с TS
+        "-f", "mpegts",
+        "-y",                            # перезаписывать старый файл (мы даём уникальное имя)
         filename
     ]
 
-# ---------- проверка ffmpeg ----------
+def graceful_stop(process, timeout=10):
+    """
+    Мягко останавливает ffmpeg: сначала SIGINT/Ctrl+Break,
+    затем жёсткий terminate при зависании.
+    """
+    if process.poll() is not None:
+        return
+    try:
+        if sys.platform == "win32":
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            process.send_signal(signal.SIGINT)
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            process.wait()
+    except Exception:
+        process.terminate()
+        process.wait()
+
+# ----------------------------- ПРОВЕРКА FFMPEG -----------------------
 try:
     subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
 except (subprocess.CalledProcessError, FileNotFoundError):
     print("Error: FFmpeg not found. Install it and add to PATH.")
     sys.exit(1)
 
-# ---------- первый запуск ----------
+# -------------------------- ПЕРВЫЙ ЗАПУСК ----------------------------
 print(f"Fetching initial stream URL for '{ROOM_SLUG}'...")
 stream_url = None
 room_status = None
@@ -106,35 +156,54 @@ if room_status != "public" or not stream_url:
     print(f"Room status is '{room_status}'. Cannot record.")
     sys.exit(1)
 
-# ---------- генерация базового имени ----------
+# --------------- ГЕНЕРАЦИЯ ИМЕНИ ФАЙЛА (БЕЗ ПЕРЕЗАПИСИ) --------------
 now = datetime.datetime.now()
 date_str = now.strftime("%m.%d.%Y")
 hash_str = hashlib.md5(ROOM_SLUG.encode()).hexdigest()[:8]
 base_filename = f"{date_str}_{hash_str}_{ROOM_SLUG}_recording"
-filename = f"{base_filename}.mp4"
 
-# ---------- счётчик перезапусков (для уникальных имён) ----------
-restart_counter = 1
+def find_free_filename():
+    """
+    Находит первое незанятое имя: base.ts, base_part2.ts, base_part3.ts ...
+    Возвращает (filename, next_part_number).
+    """
+    if not os.path.exists(f"{base_filename}.ts"):
+        return f"{base_filename}.ts", 1
+    part = 2
+    while True:
+        candidate = f"{base_filename}_part{part}.ts"
+        if not os.path.exists(candidate):
+            return candidate, part
+        part += 1
 
-def get_next_filename():
-    """Формирует имя следующего файла при перезапуске."""
-    global restart_counter, base_filename
-    restart_counter += 1
-    return f"{base_filename}_part{restart_counter}.mp4"
+filename, restart_counter = find_free_filename()
+print(f"Output file: {filename}")
 
 ffmpeg_cmd = build_ffmpeg_cmd(stream_url, filename)
 print(f"Starting recording to {filename}...")
 ffmpeg_process = subprocess.Popen(ffmpeg_cmd)
 
-# ---------- главный цикл мониторинга ----------
+def get_next_filename():
+    """
+    Увеличивает счётчик и возвращает имя для следующей части.
+    """
+    global restart_counter, base_filename
+    restart_counter += 1
+    candidate = f"{base_filename}_part{restart_counter}.ts"
+    # на случай, если такой файл уже есть (маловероятно)
+    while os.path.exists(candidate):
+        restart_counter += 1
+        candidate = f"{base_filename}_part{restart_counter}.ts"
+    return candidate
+
+# ------------------- ГЛАВНЫЙ ЦИКЛ МОНИТОРИНГА -----------------------
 last_url_check = time.time()
 
 try:
     while True:
-        # Проверяем, жив ли ffmpeg
         poll = ffmpeg_process.poll()
         if poll is not None:
-            # ffmpeg завершился (возможно с ошибкой)
+            # FFmpeg упал – восстанавливаемся
             print(f"FFmpeg exited with code {poll}. Refreshing stream URL...")
             for attempt in range(URL_FETCH_RETRIES):
                 try:
@@ -153,29 +222,25 @@ try:
                 time.sleep(FFMPEG_RESTART_DELAY)
                 continue
 
-            # Новое уникальное имя файла, чтобы не перезаписывать предыдущий
             new_filename = get_next_filename()
             ffmpeg_cmd = build_ffmpeg_cmd(stream_url, new_filename)
             print(f"Restarting FFmpeg to {new_filename}")
             ffmpeg_process = subprocess.Popen(ffmpeg_cmd)
             last_url_check = time.time()
         else:
-            # Плановая проверка смены URL
+            # Плановая проверка смены URL (каждые AUTO_REFRESH_INTERVAL)
             if AUTO_REFRESH and (time.time() - last_url_check > AUTO_REFRESH_INTERVAL):
                 last_url_check = time.time()
                 try:
                     new_url, new_status = fetch_stream_url()
                     if new_status != "public":
                         print("Room is not public anymore. Terminating recording.")
-                        ffmpeg_process.terminate()
-                        ffmpeg_process.wait()
+                        graceful_stop(ffmpeg_process)
                         break
                     if new_url and new_url != stream_url:
                         print("Stream URL changed, restarting recording...")
-                        ffmpeg_process.terminate()
-                        ffmpeg_process.wait()
+                        graceful_stop(ffmpeg_process)
                         stream_url = new_url
-                        # При смене URL также создаём новый файл (опционально)
                         new_filename = get_next_filename()
                         ffmpeg_cmd = build_ffmpeg_cmd(stream_url, new_filename)
                         ffmpeg_process = subprocess.Popen(ffmpeg_cmd)
@@ -185,7 +250,6 @@ try:
 
 except KeyboardInterrupt:
     print("\nInterrupted by user. Stopping recording...")
-    ffmpeg_process.terminate()
-    ffmpeg_process.wait()
+    graceful_stop(ffmpeg_process)
 
 print("Recording finished.")
