@@ -203,24 +203,24 @@ try:
     while True:
         poll = ffmpeg_process.poll()
         if poll is not None:
-            # FFmpeg упал – восстанавливаемся
-            print(f"FFmpeg exited with code {poll}. Refreshing stream URL...")
-            for attempt in range(URL_FETCH_RETRIES):
-                try:
-                    new_url, new_status = fetch_stream_url()
-                    if new_status != "public":
-                        print(f"Room is no longer public (status: {new_status}). Stopping.")
-                        sys.exit(0)
-                    if new_url:
-                        stream_url = new_url
-                        break
-                except Exception as e:
-                    print(f"Refresh attempt {attempt+1} failed: {e}")
-                    time.sleep(2)
-            else:
-                print("Failed to refresh stream URL. Waiting before retry...")
-                time.sleep(FFMPEG_RESTART_DELAY)
-                continue
+            print(f"FFmpeg exited with code {poll}. Trying to resume...")
+            # Пытаемся восстановиться бесконечно, пока комната не станет публичной
+            while True:
+                for attempt in range(URL_FETCH_RETRIES):
+                    try:
+                        new_url, new_status = fetch_stream_url()
+                        if new_status == "public" and new_url:
+                            stream_url = new_url
+                            break
+                        else:
+                            print(f"Room status is '{new_status}'. Waiting 30s before retry...")
+                            time.sleep(30)
+                    except Exception as e:
+                        print(f"Refresh attempt {attempt+1} failed: {e}")
+                        time.sleep(2)
+                if new_status == "public" and new_url:
+                    break
+                time.sleep(30)
 
             new_filename = get_next_filename()
             ffmpeg_cmd = build_ffmpeg_cmd(stream_url, new_filename)
