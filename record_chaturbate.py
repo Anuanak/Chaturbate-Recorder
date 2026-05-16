@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Chaturbate Recorder Void — запись видео+аудио в одном файле (макс. качество)
+Chaturbate Recorder Void — запись видео+аудио, уникальные имена файлов
 """
 
 import requests
@@ -14,15 +14,16 @@ import signal
 import threading
 import re
 import urllib.parse
+import secrets   # для генерации случайного hex
 
 # ----------------------------- НАСТРОЙКИ -----------------------------
 ROOM_SLUG = "seltin_sweety"
-AUTO_REFRESH = False                # плановая проверка URL (обычно не нужна)
+AUTO_REFRESH = False
 AUTO_REFRESH_INTERVAL = 300
 URL_FETCH_RETRIES = 3
 FFMPEG_RESTART_DELAY = 5
 OUTPUT_BASE_DIR = "recordings"
-HANG_TIMEOUT = 60                  # секунд без новых кадров → перезапуск
+HANG_TIMEOUT = 60
 HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -48,12 +49,7 @@ os.makedirs(room_dir, exist_ok=True)
 
 # ---------- функции ----------
 def fetch_best_stream():
-    """
-    Возвращает URL потока, который содержит и видео, и аудио (если доступно).
-    Приоритет: комбинированный поток с максимальным битрейтом.
-    Если комбинированного нет — берём видео макс. качества + отдельное аудио.
-    Возвращает (url, room_status).
-    """
+    """Возвращает URL комбинированного потока (видео+аудио) или кортеж (видео, аудио)."""
     payload = {"room_slug": ROOM_SLUG}
     try:
         resp = requests.post(API_URL, headers=HEADERS, data=payload, timeout=15)
@@ -72,7 +68,6 @@ def fetch_best_stream():
     if not master_url:
         raise Exception("No stream URL in API response")
 
-    # Получаем мастер-плейлист
     try:
         master_resp = requests.get(master_url, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=15)
         master_resp.raise_for_status()
@@ -81,7 +76,7 @@ def fetch_best_stream():
         raise Exception(f"Failed to fetch master playlist: {e}")
 
     lines = content.splitlines()
-    variants = []  # (bandwidth, url, has_audio)
+    variants = []
 
     for i, line in enumerate(lines):
         if line.startswith("#EXT-X-STREAM-INF"):
@@ -94,22 +89,21 @@ def fetch_best_stream():
                 variant_url = urllib.parse.urljoin(master_url, lines[i+1].strip())
                 variants.append((bandwidth, variant_url, has_audio))
 
-    # 1) Ищем комбинированный поток (видео + аудио) с макс. битрейтом
+    # 1) Комбинированный поток с макс. битрейтом
     combined = [v for v in variants if v[2]]
     if combined:
         combined.sort(key=lambda x: x[0], reverse=True)
         best = combined[0]
-        print(f"Selected combined stream: {best[0]} bps, {best[1][:80]}...")
+        print(f"Selected combined stream: {best[0]} bps")
         return best[1], room_status
 
-    # 2) Если комбинированного нет, будем брать видео + аудио отдельно,
-    #    но эта ситуация маловероятна при наличии аудио.
+    # 2) Видео + отдельное аудио (если нет комбинированного)
     video_variants = [v for v in variants if not v[2]]
     if not video_variants:
         raise Exception("No video variants found")
     video_variants.sort(key=lambda x: x[0], reverse=True)
     video_url = video_variants[0][1]
-    # Ищем отдельную аудиодорожку из EXT-X-MEDIA
+
     audio_url = None
     for line in lines:
         if line.startswith("#EXT-X-MEDIA:") and "TYPE=AUDIO" in line:
@@ -117,18 +111,13 @@ def fetch_best_stream():
             if uri_match:
                 audio_url = urllib.parse.urljoin(master_url, uri_match.group(1))
                 break
+
     if audio_url:
-        # Возвращаем специальный формат: видео+аудио, склеим в ffmpeg
         return (video_url, audio_url), room_status
     else:
         return video_url, room_status
 
 def build_ffmpeg_cmd(stream_input, filename):
-    """
-    stream_input может быть:
-    - строкой (один URL комбинированного потока)
-    - кортежем (video_url, audio_url)
-    """
     cmd = [
         "ffmpeg",
         "-user_agent", HEADERS["User-Agent"],
@@ -177,6 +166,15 @@ except (subprocess.CalledProcessError, FileNotFoundError):
     print("Error: FFmpeg not found.")
     sys.exit(1)
 
+# ---------- генерация уникального имени ----------
+def generate_unique_basename():
+    """Возвращает базовое имя (без расширения) с уникальным коротким идентификатором."""
+    now = datetime.datetime.now()
+    date_str = now.strftime("%m.%d.%Y")
+    # 8 случайных символов hex
+    unique_id = secrets.token_hex(4)   # 4 байта = 8 символов
+    return os.path.join(room_dir, f"{date_str}_{unique_id}_{ROOM_SLUG}_recording")
+
 # ---------- первый запуск ----------
 print(f"Fetching stream for '{ROOM_SLUG}'...")
 stream_input = None
@@ -205,36 +203,18 @@ if room_status != "public" or not stream_input:
         except Exception as e:
             print(f"Retry failed: {e}")
 
-# ---------- генерация имени ----------
-now = datetime.datetime.now()
-date_str = now.strftime("%m.%d.%Y")
-hash_str = hashlib.md5(ROOM_SLUG.encode()).hexdigest()[:8]
-base_filename = os.path.join(room_dir, f"{date_str}_{hash_str}_{ROOM_SLUG}_recording")
-
-def find_free_filename():
-    if not os.path.exists(f"{base_filename}.ts"):
-        return f"{base_filename}.ts", 1
-    part = 2
-    while True:
-        candidate = f"{base_filename}_part{part}.ts"
-        if not os.path.exists(candidate):
-            return candidate, part
-        part += 1
-
-filename, restart_counter = find_free_filename()
+# Первый файл получает уникальное имя
+base_filename = generate_unique_basename()
+filename = f"{base_filename}.ts"
 print(f"Output: {filename}")
 
 ffmpeg_cmd = build_ffmpeg_cmd(stream_input, filename)
 ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stderr=subprocess.PIPE, universal_newlines=True)
 
+# Функция для получения имени следующей части (тоже уникальный хеш)
 def get_next_filename():
-    global restart_counter, base_filename
-    restart_counter += 1
-    candidate = f"{base_filename}_part{restart_counter}.ts"
-    while os.path.exists(candidate):
-        restart_counter += 1
-        candidate = f"{base_filename}_part{restart_counter}.ts"
-    return candidate
+    base = generate_unique_basename()
+    return f"{base}.ts"
 
 # ---------- сторожевой таймер ----------
 last_frame_time = time.time()
