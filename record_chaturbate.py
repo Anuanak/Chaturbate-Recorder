@@ -10,16 +10,14 @@ import sys
 import datetime
 import hashlib
 import time
-import urllib.parse
-import re
 import os
 import signal
 
 # ----------------------------- НАСТРОЙКИ -----------------------------
 ROOM_SLUG = "seltin_sweety"              # комната по умолчанию
-AUTO_REFRESH = False                     # если True — раз в N секунд проверяет смену URL (редко нужно)
-AUTO_REFRESH_INTERVAL = 300              # интервал проверки (только если AUTO_REFRESH = True)
-URL_FETCH_RETRIES = 3                    # число попыток получить ссылку при сбое
+AUTO_REFRESH = False                     # плановая проверка URL (обычно не нужна)
+AUTO_REFRESH_INTERVAL = 300              # интервал проверки (если включена)
+URL_FETCH_RETRIES = 3                    # попыток получить ссылку при сбое
 FFMPEG_RESTART_DELAY = 5                 # пауза перед перезапуском ffmpeg
 OUTPUT_BASE_DIR = "recordings"           # корневая папка для всех записей
 HEADERS = {
@@ -48,8 +46,8 @@ os.makedirs(room_dir, exist_ok=True)
 # --------------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ------------------
 def fetch_stream_url():
     """
-    Получает URL потока максимального качества через API.
-    Возвращает (stream_url, room_status) или (None, status) при неудаче.
+    Получает мастер-плейлист HLS (со звуком и видео) через API.
+    Возвращает (master_url, room_status) или (None, status) при неудаче.
     """
     payload = {"room_slug": ROOM_SLUG}
     try:
@@ -68,37 +66,13 @@ def fetch_stream_url():
     master_url = data.get("url")
     if not master_url:
         raise Exception("No stream URL in API response")
-
-    # Загружаем мастер-плейлист и выбираем вариант с макс. битрейтом
-    try:
-        master_resp = requests.get(master_url, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=15)
-        master_resp.raise_for_status()
-        lines = master_resp.text.splitlines()
-    except Exception as e:
-        raise Exception(f"Failed to fetch master playlist: {e}")
-
-    max_bw = 0
-    best_variant = None
-    for i, line in enumerate(lines):
-        if line.startswith("#EXT-X-STREAM-INF") and "BANDWIDTH=" in line:
-            match = re.search(r'BANDWIDTH=(\d+)', line)
-            if match:
-                bw = int(match.group(1))
-                if bw > max_bw:
-                    max_bw = bw
-                    if i + 1 < len(lines):
-                        best_variant = lines[i + 1].strip()
-
-    if best_variant:
-        stream_url = urllib.parse.urljoin(master_url, best_variant)
-    else:
-        stream_url = master_url
-    return stream_url, room_status
+    # Не парсим варианты вручную – пусть ffmpeg сам выберет видео+аудио
+    return master_url, room_status
 
 def build_ffmpeg_cmd(stream_url, filename):
     """
-    Собирает команду ffmpeg для записи в MPEG-TS с корректным
-    преобразованием H.264 из avcC в Annex B.
+    Собирает команду ffmpeg для записи в MPEG-TS со звуком.
+    -map 0 гарантирует копирование всех доступных потоков (видео и аудио).
     """
     return [
         "ffmpeg",
@@ -106,15 +80,16 @@ def build_ffmpeg_cmd(stream_url, filename):
         "-user_agent", HEADERS["User-Agent"],
         "-headers", "Referer: https://chaturbate.com/\r\n",
         "-i", stream_url,
+        "-map", "0",                      # взять все потоки из HLS (видео + аудио)
         "-c", "copy",
-        "-bsf:v", "h264_mp4toannexb",
+        "-bsf:v", "h264_mp4toannexb",     # для совместимости с TS
         "-f", "mpegts",
         "-y",
         filename
     ]
 
 def graceful_stop(process, timeout=10):
-    """Мягко завершить ffmpeg, давая время на запись последних пакетов."""
+    """Мягко завершить ffmpeg, давая время дописать пакеты."""
     if process.poll() is not None:
         return
     try:
@@ -205,7 +180,6 @@ try:
     while True:
         poll = ffmpeg_process.poll()
         if poll is not None:
-            # FFmpeg упал — сразу пытаемся перезапуститься
             print(f"FFmpeg exited with code {poll}. Attempting immediate recovery...")
             while True:
                 for attempt in range(URL_FETCH_RETRIES):
@@ -230,7 +204,6 @@ try:
             ffmpeg_process = subprocess.Popen(ffmpeg_cmd)
             last_url_check = time.time()
 
-        # Опциональная плановая проверка (только если включена)
         if AUTO_REFRESH and (time.time() - last_url_check > AUTO_REFRESH_INTERVAL):
             last_url_check = time.time()
             try:
