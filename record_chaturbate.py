@@ -14,6 +14,7 @@ FFMPEG_RESTART_DELAY = 5
 OUTPUT_BASE_DIR = "recordings"
 HANG_TIMEOUT = 60
 STATUS_INTERVAL = 1  # как часто обновлять строку статуса (сек)
+IGNORE_PATTERNS = ("Found duplicated MOOV Atom","Last message repeated","Error reading HTTP response: End of file",)  # безвредные предупреждения ffmpeg
 HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -45,7 +46,6 @@ stats = {
     "bitrate": "N/A",
     "speed": "N/A",
     "fps": "0",
-    "dup": "0",
     "drop": "0",
     "file": "",
     "files": 0,
@@ -53,19 +53,19 @@ stats = {
     "session_start": time.time(),
 }
 
+
 def fmt_size(n):
     n = float(n)
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024 or unit == "TB":
-            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+            return f"{int(n)} B" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024
 
-def fmt_speed(bps):
-    return f"{fmt_size(bps)}/s ({bps * 8 / 1_000_000:.2f} Mbit/s)"
 
 def fmt_time(sec):
     sec = int(sec)
     return f"{sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
+
 
 def log(msg):
     """Печать сообщения, не ломая строку статуса."""
@@ -73,6 +73,7 @@ def log(msg):
     with print_lock:
         sys.stdout.write("\r" + " " * width + "\r" + msg + "\n")
         sys.stdout.flush()
+
 
 def status_loop():
     prev_size, prev_t = 0, time.time()
@@ -84,12 +85,9 @@ def status_loop():
             size = stats["size"]
             total = stats["done_bytes"] + size
             out_time = stats["out_time"]
-            bitrate = stats["bitrate"]
             speed = stats["speed"]
-            fps = stats["fps"]
             drop = stats["drop"]
             restarts = stats["restarts"]
-            files = stats["files"]
         delta = size - prev_size
         if delta < 0:  # начался новый файл
             delta = size
@@ -103,15 +101,15 @@ def status_loop():
             free = "?"
 
         line = (
-            f"● REC {ROOM_SLUG} | запись {out_time} | файл {fmt_size(size)} | "
-            f"↓ {fmt_speed(cur_speed)} | ffmpeg {bitrate} {speed} {fps}fps drop={drop} | "
-            f"всего {fmt_size(total)} ({files} ф.) | диск {free} | рестартов {restarts} | "
-            f"работает {fmt_time(now - stats['session_start'])}"
+            f"● {out_time} | {fmt_size(size)} | "
+            f"↓ {fmt_size(cur_speed)}/s ({cur_speed * 8 / 1_000_000:.1f} Mbit/s) | "
+            f"{speed} | drop {drop} | всего {fmt_size(total)} | диск {free} | рест. {restarts}"
         )
         width = shutil.get_terminal_size((100, 20)).columns - 1
         with print_lock:
             sys.stdout.write("\r" + line[:width].ljust(width))
             sys.stdout.flush()
+
 
 # ---------- получение потока ----------
 def fetch_best_stream():
@@ -160,6 +158,7 @@ def fetch_best_stream():
     audio_url = audio_groups.get(best_video[2]) if best_video[2] else None
     return best_video[1], audio_url, room_status
 
+
 def build_ffmpeg_cmd(video_url, audio_url, filename):
     cmd = [
         "ffmpeg",
@@ -181,6 +180,7 @@ def build_ffmpeg_cmd(video_url, audio_url, filename):
     cmd += ["-c", "copy", "-bsf:v", "h264_mp4toannexb", "-f", "mpegts", "-y", filename]
     return cmd
 
+
 def graceful_stop(process, timeout=10):
     if process.poll() is not None:
         return
@@ -195,9 +195,11 @@ def graceful_stop(process, timeout=10):
         process.terminate()
         process.wait()
 
+
 # ---------- чтение вывода ffmpeg ----------
 last_frame = time.time()
 ffmpeg_process = None
+
 
 def read_progress(pipe):
     """Парсит блоки key=value из -progress."""
@@ -224,11 +226,14 @@ def read_progress(pipe):
             elif k == "drop_frames":
                 stats["drop"] = v
 
+
 def read_stderr(pipe):
     for line in iter(pipe.readline, ''):
         line = line.strip()
-        if line:
-            log(f"[ffmpeg] {line}")
+        if not line or any(p in line for p in IGNORE_PATTERNS):
+            continue
+        log(f"[ffmpeg] {line}")
+
 
 def start_ffmpeg(video_url, audio_url, fname):
     global ffmpeg_process, last_frame
@@ -247,9 +252,11 @@ def start_ffmpeg(video_url, audio_url, fname):
     threading.Thread(target=read_progress, args=(ffmpeg_process.stdout,), daemon=True).start()
     threading.Thread(target=read_stderr, args=(ffmpeg_process.stderr,), daemon=True).start()
 
+
 def get_next_filename():
     date_str = datetime.datetime.now().strftime("%m.%d.%Y")
     return os.path.join(room_dir, f"{date_str}_{secrets.token_hex(4)}_{ROOM_SLUG}_recording.ts")
+
 
 # ---------- старт ----------
 try:
