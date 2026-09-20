@@ -14,7 +14,15 @@ FFMPEG_RESTART_DELAY = 5
 OUTPUT_BASE_DIR = "recordings"
 HANG_TIMEOUT = 60
 STATUS_INTERVAL = 1  # как часто обновлять строку статуса (сек)
-IGNORE_PATTERNS = ("Found duplicated MOOV Atom","Last message repeated","Error reading HTTP response: End of file",)  # безвредные предупреждения ffmpeg
+# Ручная подстройка синхронизации, секунды.
+# Звук идёт РАНЬШЕ видео -> положительное (например 0.5)
+# Звук идёт ПОЗЖЕ видео  -> отрицательное (например -0.5)
+AUDIO_OFFSET = 0.0
+IGNORE_PATTERNS = (  # безвредные сообщения ffmpeg
+    "Found duplicated MOOV Atom",
+    "Last message repeated",
+    "Error reading HTTP response: End of file",
+)
 HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -165,6 +173,8 @@ def build_ffmpeg_cmd(video_url, audio_url, filename):
         "-loglevel", "warning",
         "-nostats",
         "-progress", "pipe:1",          # машиночитаемая статистика в stdout
+        "-copyts",                      # сохранить исходные метки времени
+        "-start_at_zero",
         "-user_agent", HEADERS["User-Agent"],
         "-headers", "Referer: https://chaturbate.com/\r\n",
         "-timeout", "10000000",
@@ -174,6 +184,16 @@ def build_ffmpeg_cmd(video_url, audio_url, filename):
         "-i", video_url
     ]
     if audio_url:
+        cmd += [
+            "-user_agent", HEADERS["User-Agent"],
+            "-headers", "Referer: https://chaturbate.com/\r\n",
+            "-timeout", "10000000",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+        ]
+        if AUDIO_OFFSET:
+            cmd += ["-itsoffset", str(AUDIO_OFFSET)]
         cmd += ["-i", audio_url, "-map", "0:v", "-map", "1:a"]
     else:
         cmd += ["-map", "0"]
